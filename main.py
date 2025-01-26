@@ -1,11 +1,14 @@
+# main.py
 import os
 import datetime
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
     filters,
+    ConversationHandler,
+    CallbackQueryHandler
 )
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime
 from sqlalchemy.ext.declarative import declarative_base
@@ -65,12 +68,37 @@ class RecurringBonus(Base):
     next_run = Column(DateTime)
     is_active = Column(Boolean, default=True)
 
+class Organization(Base):
+    __tablename__ = 'organizations'
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    admin_id = Column(String)
+
+class Group(Base):
+    __tablename__ = 'groups'
+    id = Column(Integer, primary_key=True)
+    org_id = Column(Integer)
+    group_name = Column(String)
+    telegram_group_id = Column(String)
+    is_public = Column(Boolean, default=True)
+
+class Comment(Base):
+    __tablename__ = 'comments'
+    id = Column(Integer, primary_key=True)
+    recognition_id = Column(Integer)
+    user_id = Column(String)
+    text = Column(String)
+    created_at = Column(DateTime, default=datetime.datetime.now)
+
 engine = create_engine('sqlite:///bonusly.db')
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 
 # --- Scheduler Setup ---
 scheduler = AsyncIOScheduler()
+
+# --- Conversation States ---
+ORG_CHOOSE, GROUP_CHOOSE, RECEIVER_CHOOSE, AMOUNT_INPUT, MESSAGE_INPUT = range(5)
 
 # --- Helper Functions ---
 def get_or_create_user(telegram_id, username):
@@ -85,6 +113,18 @@ def get_or_create_user(telegram_id, username):
 
 def is_admin(user_id: str) -> bool:
     return str(user_id) in ADMIN_IDS
+
+def get_org_groups(org_id):
+    session = Session()
+    groups = session.query(Group).filter_by(org_id=org_id).all()
+    session.close()
+    return groups
+
+def get_user_organizations(user_id):
+    session = Session()
+    orgs = session.query(Organization).filter_by(admin_id=str(user_id)).all()
+    session.close()
+    return orgs
 
 async def process_recurring_bonuses():
     session = Session()
@@ -140,6 +180,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🌟 Welcome {user.username}! Balance: {user.points_balance} points\n\n"
         "Commands:\n"
         "/bonus @user <amount> #tag <message> - Give points\n"
+        "/recognize - Post recognition to a group\n"
         "/balance - Check balance\n"
         "/leaderboard - Group/Global leaderboard\n"
         "/rewards - Available rewards\n"
@@ -203,168 +244,207 @@ async def give_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         session.close()
 
-async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    session = Session()
-    try:
-        chat_id = str(update.effective_chat.id)
-        is_group = update.effective_chat.type in ['group', 'supergroup']
-        
-        if is_group:
-            recognitions = session.query(Recognition).filter_by(group_id=chat_id).all()
-            points = {}
-            for rec in recognitions:
-                points[rec.receiver_id] = points.get(rec.receiver_id, 0.0) + rec.points
-            sorted_users = sorted(points.items(), key=lambda x: x[1], reverse=True)[:10]
-            response = "🏆 Group Leaderboard:\n"
-            for idx, (user_id, total) in enumerate(sorted_users, 1):
-                user = session.query(User).filter_by(telegram_id=user_id).first()
-                response += f"{idx}. @{user.username if user else 'Unknown'}: {total} points\n"
-        else:
-            top_users = session.query(User).order_by(User.points_balance.desc()).limit(10).all()
-            response = "🏆 Global Leaderboard:\n"
-            for idx, user in enumerate(top_users, 1):
-                response += f"{idx}. @{user.username}: {user.points_balance} points\n"
-        
-        await update.message.reply_text(response)
-    finally:
-        session.close()
+# --- Cross-Group Recognition Flow ---
+async def start_cross_group_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_orgs = get_user_organizations(update.effective_user.id)
+    if not user_orgs:
+        await update.message.reply_text("❌ You don't belong to any organizations")
+        return ConversationHandler.END
+    
+    buttons = [[InlineKeyboardButton(org.name, callback_data=f"org_{org.id}")] for org in user_orgs]
+    await update.message.reply_text(
+        "🏢 Select your organization:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return ORG_CHOOSE
 
-# --- Redemption System ---
-async def list_rewards(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    session = Session()
-    try:
-        rewards = session.query(Reward).all()
-        response = "🎁 Available Rewards:\n" if rewards else "No rewards available"
-        for reward in rewards:
-            response += f"\n🆔 {reward.id} {reward.name} ({reward.points_required} points)\n📝 {reward.description}\n"
-        await update.message.reply_text(response)
-    finally:
-        session.close()
+async def org_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    org_id = int(query.data.split("_")[1])
+    context.user_data['org_id'] = org_id
+    
+    groups = get_org_groups(org_id)
+    buttons = [[InlineKeyboardButton(group.group_name, callback_data=f"group_{group.id}")] for group in groups]
+    await query.edit_message_text(
+        "📚 Select a group:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return GROUP_CHOOSE
 
-async def redeem_reward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = get_or_create_user(update.effective_user.id, update.effective_user.username)
-    args = context.args
-    if not args:
-        await update.message.reply_text("❌ Usage: /redeem <reward_id>")
-        return
+async def group_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    group_id = int(query.data.split("_")[1])
+    context.user_data['group_id'] = group_id
+    
+    await query.edit_message_text("👤 Please mention or enter the username of the person you want to recognize:")
+    return RECEIVER_CHOOSE
+
+async def receiver_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    receiver_username = update.message.text.lstrip("@")
+    context.user_data['receiver'] = receiver_username
+    
+    await update.message.reply_text("💰 Enter the amount of points to give:")
+    return AMOUNT_INPUT
+
+async def amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        amount = float(update.message.text)
+        context.user_data['amount'] = amount
+        
+        await update.message.reply_text("📝 Write your recognition message:")
+        return MESSAGE_INPUT
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Please enter a number:")
+        return AMOUNT_INPUT
+
+async def message_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message.text
+    context.user_data['message'] = message
     
     session = Session()
     try:
-        reward = session.query(Reward).get(args[0])
-        if not reward:
-            await update.message.reply_text("❌ Reward not found")
-            return
-            
-        if user.points_balance < reward.points_required:
+        user_data = context.user_data
+        giver = get_or_create_user(update.effective_user.id, update.effective_user.username)
+        receiver = session.query(User).filter_by(username=user_data['receiver']).first()
+        group = session.query(Group).get(user_data['group_id'])
+
+        if not receiver or not group:
+            await update.message.reply_text("❌ Error: User or group not found")
+            return ConversationHandler.END
+
+        if giver.points_balance < user_data['amount']:
             await update.message.reply_text("❌ Insufficient points")
-            return
-            
-        request = RedemptionRequest(
-            user_id=str(user.telegram_id),
-            reward_id=reward.id
+            return ConversationHandler.END
+
+        giver.points_balance -= user_data['amount']
+        receiver.points_balance += user_data['amount']
+
+        recognition = Recognition(
+            giver_id=str(giver.telegram_id),
+            receiver_id=str(receiver.telegram_id),
+            points=user_data['amount'],
+            message=message,
+            group_id=group.telegram_group_id
         )
-        session.add(request)
+        session.add(recognition)
+        session.commit()
+
+        keyboard = [
+            [
+                InlineKeyboardButton("👍", callback_data=f"react_{recognition.id}_like"),
+                InlineKeyboardButton("💬 Comment", callback_data=f"comment_{recognition.id}")
+            ]
+        ]
+
+        msg_text = f"🎉 Recognition in {group.group_name}!\nFrom: @{giver.username}\nTo: @{receiver.username}\nAmount: {user_data['amount']}\nMessage: {message}"
+        await context.bot.send_message(
+            chat_id=group.telegram_group_id,
+            text=msg_text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+        await update.message.reply_text("✅ Recognition posted successfully!")
         
-        if not reward.requires_approval:
-            user.points_balance -= reward.points_required
-            request.status = 'approved'
-            session.commit()
-            await update.message.reply_text(f"✅ Redeemed {reward.name}!")
-        else:
-            session.commit()
-            await update.message.reply_text("⏳ Reward request sent for approval")
-            for admin_id in ADMIN_IDS:
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=f"🆕 Redemption request #{request.id} from @{user.username}"
-                )
+    finally:
+        session.close()
+    return ConversationHandler.END
+
+# --- Interactive Features ---
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data.split("_")
+    
+    if data[0] == "react":
+        recognition_id = data[1]
+        reaction_type = data[2]
+        user = get_or_create_user(query.from_user.id, query.from_user.username)
+        
+        session = Session()
+        try:
+            recognition = session.query(Recognition).get(recognition_id)
+            if recognition:
+                await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(f"👍 {reaction_type}", callback_data="dummy"),
+                    InlineKeyboardButton("💬 Comment", callback_data=f"comment_{recognition_id}")
+                ]]))
+        finally:
+            session.close()
+
+    elif data[0] == "comment":
+        recognition_id = data[1]
+        context.user_data['comment_recognition'] = recognition_id
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="💬 Enter your comment:"
+        )
+
+async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    recognition_id = context.user_data.get('comment_recognition')
+    user = get_or_create_user(update.effective_user.id, update.effective_user.username)
+    
+    session = Session()
+    try:
+        comment = Comment(
+            recognition_id=recognition_id,
+            user_id=str(user.telegram_id),
+            text=update.message.text
+        )
+        session.add(comment)
+        session.commit()
+
+        recognition = session.query(Recognition).get(recognition_id)
+        if recognition and recognition.group_id:
+            await context.bot.send_message(
+                chat_id=recognition.group_id,
+                text=f"💬 @{user.username}: {update.message.text}",
+                reply_to_message_id=recognition.id
+            )
+        
+        await update.message.reply_text("💬 Comment posted!")
     finally:
         session.close()
 
-async def approve_redemption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- Admin Commands ---
+async def add_org(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(str(update.effective_user.id)):
         await update.message.reply_text("❌ Admin only")
         return
-    
+
     args = context.args
-    if not args:
-        await update.message.reply_text("❌ Usage: /approve <request_id>")
+    if len(args) < 2:
+        await update.message.reply_text("❌ Usage: /addorg <org_name> <admin_id>")
         return
     
     session = Session()
     try:
-        request = session.query(RedemptionRequest).get(args[0])
-        if not request or request.status != 'pending':
-            await update.message.reply_text("❌ Invalid request")
-            return
-            
-        user = session.query(User).filter_by(telegram_id=request.user_id).first()
-        reward = session.query(Reward).get(request.reward_id)
-        
-        if user.points_balance < reward.points_required:
-            await update.message.reply_text("❌ User has insufficient points")
-            return
-            
-        user.points_balance -= reward.points_required
-        request.status = 'approved'
+        org = Organization(name=args[0], admin_id=args[1])
+        session.add(org)
         session.commit()
-        
-        await update.message.reply_text(f"✅ Approved request #{request.id}")
-        await context.bot.send_message(
-            chat_id=user.telegram_id,
-            text=f"🎉 Your {reward.name} redemption was approved!"
-        )
+        await update.message.reply_text(f"✅ Organization {args[0]} created")
     finally:
         session.close()
 
-# --- Recurring Bonuses ---
-async def set_recurring_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(str(update.effective_user.id)):
+        await update.message.reply_text("❌ Admin only")
+        return
+
     args = context.args
     if len(args) < 3:
-        await update.message.reply_text("❌ Usage: /recurring @user <amount> <daily|weekly|monthly>")
+        await update.message.reply_text("❌ Usage: /addgroup <org_id> <group_name> <telegram_group_id>")
         return
-    
-    receiver_username = args[0].lstrip("@")
-    amount = float(args[1])
-    interval = args[2].lower()
     
     session = Session()
     try:
-        giver = get_or_create_user(update.effective_user.id, update.effective_user.username)
-        receiver = session.query(User).filter_by(username=receiver_username).first()
-        
-        if not receiver:
-            await update.message.reply_text("❌ User not found")
-            return
-            
-        if giver.points_balance < amount:
-            await update.message.reply_text("❌ Insufficient points")
-            return
-            
-        next_run = datetime.datetime.now()
-        if interval == 'daily':
-            next_run += datetime.timedelta(days=1)
-        elif interval == 'weekly':
-            next_run += datetime.timedelta(weeks=1)
-        elif interval == 'monthly':
-            next_run = next_run.replace(month=next_run.month + 1)
-        else:
-            await update.message.reply_text("❌ Invalid interval")
-            return
-            
-        recurring_bonus = RecurringBonus(
-            giver_id=str(giver.telegram_id),
-            receiver_id=str(receiver.telegram_id),
-            amount=amount,
-            interval=interval,
-            next_run=next_run
+        group = Group(
+            org_id=int(args[0]),
+            group_name=args[1],
+            telegram_group_id=args[2]
         )
-        session.add(recurring_bonus)
+        session.add(group)
         session.commit()
-        
-        await update.message.reply_text(
-            f"✅ Set {interval} recurring bonus of {amount} points for @{receiver_username}"
-        )
+        await update.message.reply_text(f"✅ Group {args[1]} added to organization")
     finally:
         session.close()
 
@@ -381,6 +461,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("recurring", set_recurring_bonus))
     
     # Admin commands
+    app.add_handler(CommandHandler("addorg", add_org))
+    app.add_handler(CommandHandler("addgroup", add_group))
     app.add_handler(CommandHandler("approve", approve_redemption))
     app.add_handler(CommandHandler("addpoints", add_points))
     app.add_handler(CommandHandler("reset", reset_user))
@@ -388,9 +470,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("userinfo", user_info))
     app.add_handler(CommandHandler("export", export_data))
     
-    # Start scheduler
-    scheduler.add_job(process_recurring_bonuses, 'interval', minutes=60)
-    scheduler.start()
-    
-    print("Bot is running...")
-    app.run_polling()
+    # Conversation handler
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('
