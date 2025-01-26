@@ -470,6 +470,25 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("userinfo", user_info))
     app.add_handler(CommandHandler("export", export_data))
     
-    # Conversation handler
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('
+        entry_points=[CommandHandler('recognize', start_cross_group_bonus)],
+        states={
+            ORG_CHOOSE: [CallbackQueryHandler(org_chosen)],
+            GROUP_CHOOSE: [CallbackQueryHandler(group_chosen)],
+            RECEIVER_CHOOSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receiver_chosen)],
+            AMOUNT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, amount_received)],
+            MESSAGE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, message_received)]
+        },
+        fallbacks=[]
+    )
+    
+    app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_comment))
+    
+    # Start scheduler
+    scheduler.add_job(process_recurring_bonuses, 'interval', minutes=60)
+    scheduler.start()
+    
+    print("Bot is running...")
+    app.run_polling()
