@@ -8,7 +8,8 @@ from telegram.ext import (
     ContextTypes,
     filters,
     ConversationHandler,
-    CallbackQueryHandler
+    CallbackQueryHandler, 
+    MessageHandler
 )
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime
 from sqlalchemy.ext.declarative import declarative_base
@@ -23,6 +24,18 @@ ADMIN_IDS = os.getenv("ADMIN_IDS", "").split(",")
 
 # --- Database Setup ---
 Base = declarative_base()
+class Organization(Base):
+    __tablename__ = 'organizations'
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    admin_id = Column(String)  # Telegram ID of org admin
+    created_at = Column(DateTime, default=datetime.datetime.now)
+
+class UserOrganization(Base):
+    __tablename__ = 'user_organizations'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String)
+    org_id = Column(Integer)
 
 class User(Base):
     __tablename__ = 'users'
@@ -68,12 +81,6 @@ class RecurringBonus(Base):
     next_run = Column(DateTime)
     is_active = Column(Boolean, default=True)
 
-class Organization(Base):
-    __tablename__ = 'organizations'
-    id = Column(Integer, primary_key=True)
-    name = Column(String)
-    admin_id = Column(String)
-
 class Group(Base):
     __tablename__ = 'groups'
     id = Column(Integer, primary_key=True)
@@ -99,6 +106,8 @@ scheduler = AsyncIOScheduler()
 
 # --- Conversation States ---
 ORG_CHOOSE, GROUP_CHOOSE, RECEIVER_CHOOSE, AMOUNT_INPUT, MESSAGE_INPUT = range(5)
+ORG_NAME, ORG_PASSWORD, GROUP_INFO, CONFIRM_GROUP = range(4)
+ADD_USER_ORG, ADD_USER_DETAILS = range(2)
 
 # --- Helper Functions ---
 def get_or_create_user(telegram_id, username):
@@ -175,23 +184,41 @@ async def process_recurring_bonuses():
 
 # --- Bot Commands ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = get_or_create_user(update.effective_user.id, update.effective_user.username)
-    help_text = (
-        f"🌟 Welcome {user.username}! Balance: {user.points_balance} points\n\n"
-        "Commands:\n"
-        "/bonus @user <amount> #tag <message> - Give points\n"
-        "/recognize - Post recognition to a group\n"
-        "/balance - Check balance\n"
-        "/leaderboard - Group/Global leaderboard\n"
-        "/rewards - Available rewards\n"
-        "/redeem <reward_id> - Redeem points\n"
-        "/recurring @user <amount> <interval> - Set recurring bonus"
+    session = Session()
+    try:
+        user = get_or_create_user(update.effective_user.id, update.effective_user.username)
+        # Refresh the user in a new session context
+        user = session.merge(user)
+        help_text = (
+            f"🌟 Welcome {user.username}! Balance: {user.points_balance} points\n\n"
+            "Commands:\n"
+            "/bonus @user <amount> #tag <message> - Give points\n"
+            "/recognize - Post recognition to a group\n"
+            "/balance - Check balance\n"
+            "/leaderboard - Group/Global leaderboard\n"
+            "/rewards - Available rewards\n"
+            "/redeem <reward_id> - Redeem points\n"
+            "/recurring @user <amount> <interval> - Set recurring bonus"
+        )
+        
+        if is_admin(str(update.effective_user.id)):
+            help_text += (
+        "\n\n🔒 Admin Commands:\n"
+        "/addpoints @user <amount>\n"
+        "/reset @user\n"
+        "/announce <message>\n"
+        "/userinfo @user\n"
+        "/export\n"
+        "/adduser <telegram_id> @username\n"
+        "/approve <request_id>\n"
+        "/addorg - Create new organization\n"
+        "/org_adduser - Add user to organization\n"
+        "/list_orgs - Show all organizations\n"
+        "/org_manage - Manage organization settings"
     )
-    
-    if is_admin(str(update.effective_user.id)):
-        help_text += "\n\nAdmin Commands:\n/addpoints\n/reset\n/announce\n/userinfo\n/export\n/approve"
-    
-    await update.message.reply_text(help_text)
+        await update.message.reply_text(help_text)
+    finally:
+        session.close()
 
 async def give_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -404,47 +431,620 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("💬 Comment posted!")
     finally:
         session.close()
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    session = Session()
+    try:
+        chat_id = str(update.effective_chat.id)
+        is_group = update.effective_chat.type in ['group', 'supergroup']
+        
+        if is_group:
+            recognitions = session.query(Recognition).filter_by(group_id=chat_id).all()
+            points = {}
+            for rec in recognitions:
+                points[rec.receiver_id] = points.get(rec.receiver_id, 0.0) + rec.points
+            sorted_users = sorted(points.items(), key=lambda x: x[1], reverse=True)[:10]
+            response = "🏆 Group Leaderboard:\n"
+            for idx, (user_id, total) in enumerate(sorted_users, 1):
+                user = session.query(User).filter_by(telegram_id=user_id).first()
+                response += f"{idx}. @{user.username if user else 'Unknown'}: {total} points\n"
+        else:
+            top_users = session.query(User).order_by(User.points_balance.desc()).limit(10).all()
+            response = "🏆 Global Leaderboard:\n"
+            for idx, user in enumerate(top_users, 1):
+                response += f"{idx}. @{user.username}: {user.points_balance} points\n"
+        
+        await update.message.reply_text(response)
+    finally:
+        session.close()
 
-# --- Admin Commands ---
-async def add_org(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def list_rewards(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    session = Session()
+    try:
+        rewards = session.query(Reward).all()
+        response = "🎁 Available Rewards:\n" if rewards else "No rewards available"
+        for reward in rewards:
+            response += f"\n🆔 {reward.id} {reward.name} ({reward.points_required} points)\n📝 {reward.description}\n"
+        await update.message.reply_text(response)
+    finally:
+        session.close()
+
+async def set_recurring_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text("❌ Usage: /recurring @user <amount> <daily|weekly|monthly>")
+        return
+    
+    receiver_username = args[0].lstrip("@")
+    amount = float(args[1])
+    interval = args[2].lower()
+    
+    session = Session()
+    try:
+        giver = get_or_create_user(update.effective_user.id, update.effective_user.username)
+        receiver = session.query(User).filter_by(username=receiver_username).first()
+        
+        if not receiver:
+            await update.message.reply_text("❌ User not found")
+            return
+            
+        if giver.points_balance < amount:
+            await update.message.reply_text("❌ Insufficient points")
+            return
+            
+        next_run = datetime.datetime.now()
+        if interval == 'daily':
+            next_run += datetime.timedelta(days=1)
+        elif interval == 'weekly':
+            next_run += datetime.timedelta(weeks=1)
+        elif interval == 'monthly':
+            next_run = next_run.replace(month=next_run.month + 1)
+        else:
+            await update.message.reply_text("❌ Invalid interval")
+            return
+            
+        recurring_bonus = RecurringBonus(
+            giver_id=str(giver.telegram_id),
+            receiver_id=str(receiver.telegram_id),
+            amount=amount,
+            interval=interval,
+            next_run=next_run
+        )
+        session.add(recurring_bonus)
+        session.commit()
+        
+        await update.message.reply_text(
+            f"✅ Set {interval} recurring bonus of {amount} points for @{receiver_username}"
+        )
+    finally:
+        session.close()
+
+async def add_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(str(update.effective_user.id)):
         await update.message.reply_text("❌ Admin only")
         return
 
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("❌ Usage: /addorg <org_name> <admin_id>")
+        await update.message.reply_text("❌ Usage: /addpoints @user <amount>")
         return
+
+    username = args[0].lstrip("@")
+    amount = float(args[1])
     
     session = Session()
     try:
-        org = Organization(name=args[0], admin_id=args[1])
-        session.add(org)
+        user = session.query(User).filter_by(username=username).first()
+        if not user:
+            await update.message.reply_text("❌ User not found")
+            return
+        user.points_balance += amount
         session.commit()
-        await update.message.reply_text(f"✅ Organization {args[0]} created")
+        await update.message.reply_text(f"✅ Added {amount} points to @{username}")
     finally:
         session.close()
 
-async def add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def reset_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(str(update.effective_user.id)):
         await update.message.reply_text("❌ Admin only")
         return
 
     args = context.args
-    if len(args) < 3:
-        await update.message.reply_text("❌ Usage: /addgroup <org_id> <group_name> <telegram_group_id>")
+    if not args:
+        await update.message.reply_text("❌ Usage: /reset @user")
+        return
+
+    username = args[0].lstrip("@")
+    session = Session()
+    try:
+        user = session.query(User).filter_by(username=username).first()
+        if not user:
+            await update.message.reply_text("❌ User not found")
+            return
+        user.points_balance = 0
+        session.commit()
+        await update.message.reply_text(f"✅ Reset @{username}'s points to 0")
+    finally:
+        session.close()
+
+async def announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(str(update.effective_user.id)):
+        await update.message.reply_text("❌ Admin only")
+        return
+
+    message = " ".join(context.args)
+    if not message:
+        await update.message.reply_text("❌ Usage: /announce <message>")
+        return
+
+    session = Session()
+    try:
+        users = session.query(User).all()
+        for user in users:
+            try:
+                await context.bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=f"📢 Admin Announcement: {message}"
+                )
+            except Exception as e:
+                print(f"Failed to message {user.username}: {e}")
+        await update.message.reply_text("✅ Announcement sent to all users")
+    finally:
+        session.close()
+
+async def user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(str(update.effective_user.id)):
+        await update.message.reply_text("❌ Admin only")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("❌ Usage: /userinfo @user")
+        return
+
+    username = args[0].lstrip("@")
+    session = Session()
+    try:
+        user = session.query(User).filter_by(username=username).first()
+        if not user:
+            await update.message.reply_text("❌ User not found")
+            return
+        await update.message.reply_text(
+            f"👤 @{user.username}\n🆔 {user.telegram_id}\n💰 {user.points_balance} points"
+        )
+    finally:
+        session.close()
+
+async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(str(update.effective_user.id)):
+        await update.message.reply_text("❌ Admin only")
+        return
+
+    session = Session()
+    try:
+        recognitions = session.query(Recognition).all()
+        csv_data = "Giver,Receiver,Points,Message\n"
+        for rec in recognitions:
+            csv_data += f"{rec.giver_id},{rec.receiver_id},{rec.points},{rec.message}\n"
+        
+        with open("recognitions.csv", "w") as f:
+            f.write(csv_data)
+        
+        await update.message.reply_document(
+            document="recognitions.csv",
+            caption="📊 Recognition Data Export"
+        )
+    finally:
+        session.close()
+
+# --- Admin Commands ---
+async def add_org(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only command")
+        return ConversationHandler.END
+    
+    await update.message.reply_text("🏢 Enter organization name:")
+    return ORG_NAME
+
+async def org_name_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['org_name'] = update.message.text
+    await update.message.reply_text("🔑 Enter organization admin password:")
+    return ORG_PASSWORD
+
+async def org_password_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text != os.getenv("ORG_ADMIN_PASSWORD"):
+        await update.message.reply_text("❌ Invalid admin password")
+        return ConversationHandler.END
+    
+    await update.message.reply_text(
+        "👥 Please add the bot to your group and send the group username/ID here\n"
+        "(Make sure bot is admin in the group):"
+    )
+    return GROUP_INFO
+
+async def group_info_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        group_id = str(update.message.text)
+        chat = await context.bot.get_chat(group_id)
+        
+        # Verify bot is admin in the group
+        admins = await context.bot.get_chat_administrators(group_id)
+        bot_member = next((a for a in admins if a.user.id == context.bot.id), None)
+        
+        if not bot_member or not bot_member.can_invite_users:
+            await update.message.reply_text("❌ Bot needs admin privileges in the group")
+            return ConversationHandler.END
+        
+        context.user_data['group_id'] = group_id
+        await update.message.reply_text(
+            f"✅ Group verified: {chat.title}\n"
+            "Should I import existing members? (Yes/No)"
+        )
+        return CONFIRM_GROUP
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+        return ConversationHandler.END
+
+async def confirm_group_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text.lower() == 'yes':
+        try:
+            session = Session()
+            org = Organization(
+                name=context.user_data['org_name'],
+                admin_id=str(update.effective_user.id)
+            )
+            session.add(org)
+            session.commit()
+            
+            # Import group members
+            members = await context.bot.get_chat_members(context.user_data['group_id'])
+            imported = 0
+            
+            for member in members:
+                user = get_or_create_user(member.user.id, member.user.username)
+                session.add(UserOrganization(
+                    user_id=str(user.telegram_id),
+                    org_id=org.id
+                ))
+                imported += 1
+            
+            session.commit()
+            await update.message.reply_text(
+                f"✅ Organization '{org.name}' created\n"
+                f"Imported {imported} members from group"
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+        finally:
+            session.close()
+    else:
+        await update.message.reply_text("❌ Organization creation canceled")
+    
+    return ConversationHandler.END
+
+# Add User Conversation
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only command")
+        return ConversationHandler.END
+    
+    session = Session()
+    orgs = session.query(Organization).all()
+    session.close()
+    
+    if not orgs:
+        await update.message.reply_text("❌ No organizations exist yet")
+        return ConversationHandler.END
+    
+    buttons = [[InlineKeyboardButton(org.name, callback_data=f"org_{org.id}")] for org in orgs]
+    await update.message.reply_text(
+        "🏢 Select organization for the user:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return ADD_USER_ORG
+
+async def org_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    org_id = int(query.data.split("_")[1])
+    context.user_data['org_id'] = org_id
+    
+    await query.edit_message_text("👤 Enter user's Telegram username or ID:")
+    return ADD_USER_DETAILS
+
+async def user_details_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_input = update.message.text
+        session = Session()
+        
+        # Find or create user
+        if user_input.startswith("@"):
+            user = session.query(User).filter_by(username=user_input[1:]).first()
+        else:
+            user = session.query(User).filter_by(telegram_id=user_input).first()
+        
+        if not user:
+            await update.message.reply_text("❌ User not found. Create user first with /adduser")
+            return ConversationHandler.END
+        
+        # Add to organization
+        session.add(UserOrganization(
+            user_id=str(user.telegram_id),
+            org_id=context.user_data['org_id']
+        ))
+        session.commit()
+        
+        await update.message.reply_text(
+            f"✅ User @{user.username} added to organization\n"
+            f"User ID: {user.telegram_id}"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+    finally:
+        session.close()
+    
+    return ConversationHandler.END
+
+async def add_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(str(update.effective_user.id)):
+        await update.message.reply_text("❌ Admin only")
+        return
+
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("❌ Usage: /addpoints @user <amount>")
+        return
+
+    try:
+        username = args[0].lstrip("@")
+        amount = float(args[1])
+        
+        if amount <= 0:
+            await update.message.reply_text("❌ Amount must be positive")
+            return
+
+        session = Session()
+        user = session.query(User).filter_by(username=username).first()
+        
+        if not user:
+            await update.message.reply_text("❌ User not found")
+            return
+            
+        user.points_balance += amount
+        session.commit()
+        
+        # Notify user
+        try:
+            await context.bot.send_message(
+                chat_id=user.telegram_id,
+                text=f"🎁 Admin added {amount} points to your account!\nNew balance: {user.points_balance}"
+            )
+        except Exception as e:
+            print(f"Could not notify user: {e}")
+        
+        await update.message.reply_text(f"✅ Added {amount} points to @{username}")
+        
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount")
+    finally:
+        session.close()
+
+async def reset_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(str(update.effective_user.id)):
+        await update.message.reply_text("❌ Admin only")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("❌ Usage: /reset @user")
+        return
+
+    username = args[0].lstrip("@")
+    session = Session()
+    try:
+        user = session.query(User).filter_by(username=username).first()
+        if not user:
+            await update.message.reply_text("❌ User not found")
+            return
+            
+        user.points_balance = 0
+        session.commit()
+        
+        # Notify user
+        try:
+            await context.bot.send_message(
+                chat_id=user.telegram_id,
+                text="🔄 Your points have been reset to 0 by admin"
+            )
+        except Exception as e:
+            print(f"Could not notify user: {e}")
+            
+        await update.message.reply_text(f"✅ Reset @{username}'s points to 0")
+    finally:
+        session.close()
+
+async def user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(str(update.effective_user.id)):
+        await update.message.reply_text("❌ Admin only")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("❌ Usage: /userinfo @user")
+        return
+
+    username = args[0].lstrip("@")
+    session = Session()
+    try:
+        user = session.query(User).filter_by(username=username).first()
+        if not user:
+            await update.message.reply_text("❌ User not found")
+            return
+            
+        recognitions = session.query(Recognition).filter_by(receiver_id=user.telegram_id).count()
+        
+        response = (
+            f"👤 User: @{user.username}\n"
+            f"🆔 ID: {user.telegram_id}\n"
+            f"💰 Balance: {user.points_balance}\n"
+            f"🏆 Total Recognitions: {recognitions}"
+        )
+        await update.message.reply_text(response)
+    finally:
+        session.close()
+
+# --- Enhanced Give Bonus with PM Notifications ---
+async def give_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 4:
+        await update.message.reply_text("❌ Format: /bonus @user <amount> #tag <message>")
+        return
+
+    try:
+        receiver_username = args[0].lstrip("@")
+        amount = float(args[1])
+        
+        if amount <= 0:
+            await update.message.reply_text("❌ Amount must be positive")
+            return
+
+        tags = [arg for arg in args[2:] if arg.startswith("#")]
+        message = " ".join([arg for arg in args[2:] if not arg.startswith("#")])
+        
+        session = Session()
+        giver = get_or_create_user(update.effective_user.id, update.effective_user.username)
+        receiver = session.query(User).filter_by(username=receiver_username).first()
+
+        if not receiver:
+            await update.message.reply_text("❌ User not found")
+            return
+            
+        if giver.points_balance < amount:
+            await update.message.reply_text("❌ Insufficient points")
+            return
+
+        # Perform transaction
+        giver.points_balance -= amount
+        receiver.points_balance += amount
+        
+        recognition = Recognition(
+            giver_id=str(giver.telegram_id),
+            receiver_id=str(receiver.telegram_id),
+            points=amount,
+            message=message,
+            tags=",".join(tags)
+        )
+        session.add(recognition)
+        session.commit()
+        
+        # Notify receiver
+        try:
+            await context.bot.send_message(
+                chat_id=receiver.telegram_id,
+                text=f"🎉 You received {amount} points from @{giver.username}!\n"
+                     f"Message: {message}\n"
+                     f"Your new balance: {receiver.points_balance}"
+            )
+        except Exception as e:
+            print(f"Could not notify receiver: {e}")
+            
+        # Notify giver
+        try:
+            await context.bot.send_message(
+                chat_id=giver.telegram_id,
+                text=f"✅ You gave {amount} points to @{receiver_username}!\n"
+                     f"Your new balance: {giver.points_balance}"
+            )
+        except Exception as e:
+            print(f"Could not notify giver: {e}")
+            
+        # Public response
+        response = f"🎉 @{giver.username} gave {amount} points to @{receiver_username}!"
+        if tags:
+            response += f"\n🏷 Tags: {', '.join(tags)}"
+        response += f"\n📝 Message: {message}"
+        
+        await update.message.reply_text(response)
+        
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount format")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+    finally:
+        session.close()
+    # Redemption functions 
+async def redeem_reward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_or_create_user(update.effective_user.id, update.effective_user.username)
+    args = context.args
+    if not args:
+        await update.message.reply_text("❌ Usage: /redeem <reward_id>")
         return
     
     session = Session()
     try:
-        group = Group(
-            org_id=int(args[0]),
-            group_name=args[1],
-            telegram_group_id=args[2]
+        reward = session.query(Reward).get(args[0])
+        if not reward:
+            await update.message.reply_text("❌ Reward not found")
+            return
+            
+        if user.points_balance < reward.points_required:
+            await update.message.reply_text("❌ Insufficient points")
+            return
+            
+        request = RedemptionRequest(
+            user_id=str(user.telegram_id),
+            reward_id=reward.id
         )
-        session.add(group)
+        session.add(request)
+        
+        if not reward.requires_approval:
+            user.points_balance -= reward.points_required
+            request.status = 'approved'
+            session.commit()
+            await update.message.reply_text(f"✅ Redeemed {reward.name}!")
+        else:
+            session.commit()
+            await update.message.reply_text("⏳ Reward request sent for approval")
+            for admin_id in ADMIN_IDS:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"🆕 Redemption request #{request.id} from @{user.username}"
+                )
+    finally:
+        session.close()
+
+async def approve_redemption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(str(update.effective_user.id)):
+        await update.message.reply_text("❌ Admin only")
+        return
+    
+    args = context.args
+    if not args:
+        await update.message.reply_text("❌ Usage: /approve <request_id>")
+        return
+    
+    session = Session()
+    try:
+        request = session.query(RedemptionRequest).get(args[0])
+        if not request or request.status != 'pending':
+            await update.message.reply_text("❌ Invalid request")
+            return
+            
+        user = session.query(User).filter_by(telegram_id=request.user_id).first()
+        reward = session.query(Reward).get(request.reward_id)
+        
+        if user.points_balance < reward.points_required:
+            await update.message.reply_text("❌ User has insufficient points")
+            return
+            
+        user.points_balance -= reward.points_required
+        request.status = 'approved'
         session.commit()
-        await update.message.reply_text(f"✅ Group {args[1]} added to organization")
+        
+        await update.message.reply_text(f"✅ Approved request #{request.id}")
+        await context.bot.send_message(
+            chat_id=user.telegram_id,
+            text=f"🎉 Your {reward.name} redemption was approved!"
+        )
     finally:
         session.close()
 
@@ -462,7 +1062,6 @@ if __name__ == "__main__":
     
     # Admin commands
     app.add_handler(CommandHandler("addorg", add_org))
-    app.add_handler(CommandHandler("addgroup", add_group))
     app.add_handler(CommandHandler("approve", approve_redemption))
     app.add_handler(CommandHandler("addpoints", add_points))
     app.add_handler(CommandHandler("reset", reset_user))
@@ -481,6 +1080,29 @@ if __name__ == "__main__":
         },
         fallbacks=[]
     )
+
+    conv_add_user = ConversationHandler(
+    entry_points=[CommandHandler('add_user', add_user)],
+    states={
+        ADD_USER_ORG: [CallbackQueryHandler(org_selected)],
+        ADD_USER_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, user_details_received)]
+    },
+    fallbacks=[]
+    )
+
+    conv_org = ConversationHandler(
+    entry_points=[CommandHandler('addorg', add_org)],
+    states={
+        ORG_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, org_name_received)],
+        ORG_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, org_password_received)],
+        GROUP_INFO: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_info_received)],
+        CONFIRM_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_group_import)]
+    },
+    fallbacks=[]
+    )
+
+    app.add_handler(conv_org)
+    app.add_handler(conv_add_user)
     
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(button_handler))
